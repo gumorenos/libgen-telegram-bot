@@ -12,14 +12,10 @@ _TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
 
 
 class LibgenMetadataProvider:
-    """Metadata-only adapter for a local LibGen-compatible SQLite FTS index.
+    """Metadata-only adapter for a local LibGen-compatible SQLite FTS index."""
 
-    This provider performs no network requests, does not construct mirror/download
-    URLs, and intentionally returns an empty ``formats`` mapping.
-    """
-
-    key = "libgen"
-    label = "LibGen metadata"
+    key = "libgen-local"
+    label = "LibGen local metadata"
 
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
@@ -58,7 +54,7 @@ class LibgenMetadataProvider:
         for rowid, title, author, language in rows:
             books.append(
                 BookResult(
-                    source=self.key,
+                    source="libgen",
                     source_label=self.label,
                     source_id=f"row:{rowid}",
                     title=(title or "Sin título").strip(),
