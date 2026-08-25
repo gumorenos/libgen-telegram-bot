@@ -6,6 +6,8 @@ from ..models import BookResult
 from .base import BookProvider, ProviderHealth
 from .gutenberg import GutendexProvider
 from .libgen import LibgenMetadataProvider
+from .libgen_hybrid import LibgenProvider
+from .libgen_live import LibgenLiveProvider
 from .registry import ProviderRegistry
 
 
@@ -33,13 +35,25 @@ def build_registry(
     enabled: tuple[str, ...],
     gutendex_base_url: str,
     libgen_metadata_db: Path,
+    libgen_live_mirrors: tuple[str, ...],
 ) -> ProviderRegistry:
     providers: list[BookProvider] = []
     for key in enabled:
         if key == "gutenberg":
             providers.append(GutendexProvider(gutendex_base_url))
         elif key == "libgen":
-            providers.append(LibgenMetadataProvider(libgen_metadata_db))
+            local_provider = LibgenMetadataProvider(libgen_metadata_db)
+            live_provider = (
+                LibgenLiveProvider(libgen_live_mirrors)
+                if libgen_live_mirrors
+                else None
+            )
+            providers.append(
+                LibgenProvider(
+                    local_provider=local_provider,
+                    live_provider=live_provider,
+                )
+            )
     return ProviderRegistry(providers)
 
 
@@ -48,6 +62,8 @@ __all__ = [
     "ProviderHealth",
     "GutendexProvider",
     "LibgenMetadataProvider",
+    "LibgenLiveProvider",
+    "LibgenProvider",
     "ProviderRegistry",
     "build_registry",
     "preferred_downloads",
