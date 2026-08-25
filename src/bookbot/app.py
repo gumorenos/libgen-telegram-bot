@@ -206,15 +206,41 @@ async def book_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     language = ", ".join(book.languages) if book.languages else "—"
     count = str(book.download_count) if book.download_count is not None else "—"
     text = (
-        f"📶 {book.title}\n"
+        f"📖 {book.title}\n"
+        f"Fuente: {book.source_label}\n"
         f"Autor: {book.author_text}\n"
         f"Idioma: {language}\n"
-        f"Descargas en catálogo: {count}\n"
-        f"Fuente: {book.source_label}"
+        f"Descargas de catálogo: {count}\n"
     )
     if not keyboard:
-        text += "\n\nNo hay un formato descargable permitido para este resultado."
+        text += "\nEste proveedor aporta metadatos, pero no hay descarga automática habilitada para este resultado."
+
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
+
+
+async def _download_with_validated_redirects(url: str, target: Path, max_bytes: int) -> int:
+    current = url
+    async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
+        for _ in range(6):
+            if not is_allowed_download_url(current):
+                raise ValueError("download URL is not allowed")
+            async with client.stream("GET", current, headers={"User-Agent": "ebook-telegram-bot/0.2"}) as response:
+                if response.is_redirect:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise ValueError("redirect without Location")
+                    current = urljoin(str(response.url), location)
+                    continue
+                response.raise_for_status()
+                total = 0
+                with target.open("wb") as handle:
+                    async for chunk in response.aiter_bytes():
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise ValueError("download exceeds configured maximum")
+                        handle.write(chunk)
+                return total
+    raise ValueError("too many redirects")
 
 
 async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -225,78 +251,34 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     query = update.callback_query
     await query.answer("Preparando archivo…")
     try:
-        _, book_idx_s, dl_idx_s = query.data.split(":")
+        _, book_idx_s, download_idx_s = query.data.split(":")
         book_idx = int(book_idx_s)
-        dl_idx = int(dl_idx_s)
+        download_idx = int(download_idx_s)
         books: list[BookResult] = context.user_data.get("results", [])
         book = books[book_idx]
-        label, url = preferred_downloads(book)[dl_idx]
+        label, url = preferred_downloads(book)[download_idx]
     except (ValueError, IndexError):
-        await query.message.reply_text("El resultado expiró. Haz una nueva búsqueda.")
+        await query.message.reply_text("Ese enlace expiró. Haz una nueva búsqueda.")
         return
 
     if not is_allowed_download_url(url):
-        await query.message.reply_text("URL de descarga rechazada por la política de seguridad del bot.")
+        await query.message.reply_text("El origen del archivo no está permitido.")
         return
 
-    max_bytes = settings.max_download_mb * 1024 * 1024
-    suffix = {"EPUB": ".epub", "PDF": ".pdf", "TXT": ".txt", "HTML": ".html"}.get(label, ".bin")
-    filename = sanitize_filename(f"{book.title}{suffix}")
-
     await query.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-    path: Path | None = None
-    response: httpx.Response | None = None
+    suffix = {"EPUB": ".epub", "PDF": ".pdf", "TXT": ".txt", "HTML": ".html"}.get(label, ".bin")
+    safe_name = sanitize_filename(book.title, suffix)
+    max_bytes = settings.max_download_mb * 1024 * 1024
+
     try:
-        async with httpx.AsyncClient(timeout=60, follow_redirects=False) as client:
-            current_url = url
-            for _ in range(6):
-                if not is_allowed_download_url(current_url):
-                    raise ValueError("download redirect left the Gutenberg allowlist")
-                request = client.build_request("GET", current_url)
-                response = await client.send(request, stream=True)
-                if response.status_code in {301, 302, 303, 307, 308}:
-                    location = response.headers.get("location")
-                    await response.aclose()
-                    response = None
-                    if not location:
-                        raise httpx.HTTPStatusError("redirect without location", request=request, response=httpx.Response(502, request=request))
-                    current_url = urljoin(current_url, location)
-                    continue
-                response.raise_for_status()
-                break
-            else:
-                raise ValueError("too many redirects")
-
-            if response is None:
-                raise ValueError("download response missing")
-
-            content_length = int(response.headers.get("content-length", "0") or 0)
-            if content_length and content_length > max_bytes:
-                await query.message.reply_text(f"El archivo supera el límite configurado de {settings.max_download_mb} MB.")
-                return
-
-            with tempfile.NamedTemporaryFile(prefix="bookbot-", suffix=suffix, delete=False) as tmp:
-                path = Path(tmp.name)
-                total = 0
-                async for chunk in response.aiter_bytes():
-                    total += len(chunk)
-                    if total > max_bytes:
-                        await query.message.reply_text(f"El archivo supera el límite configurado de {settings.max_download_mb} MB.")
-                        return
-                    tmp.write(chunk)
-
-        if path is None:
-            raise ValueError("temporary download missing")
-        with path.open("rb") as fh:
-            await query.message.reply_document(document=fh, filename=filename, read_timeout=120, write_timeout=120)
-    except (httpx.HTTPError, ValueError) as exc:
+        with tempfile.TemporaryDirectory(prefix="ebookbot-") as temp_dir:
+            target = Path(temp_dir) / safe_name
+            await _download_with_validated_redirects(url, target, max_bytes)
+            with target.open("rb") as handle:
+                await query.message.reply_document(document=handle, filename=safe_name, caption=f"{book.title} — {book.author_text}")
+    except (httpx.HTTPError, OSError, ValueError) as exc:
         logger.warning("Download failed: %s", exc)
-        await query.message.reply_text("No pude descargar ese archivo desde la fuente permitida.")
-    finally:
-        if response is not None:
-            await response.aclose()
-        if path is not None:
-            path.unlink(missing_ok=True)
+        await query.message.reply_text("No pude descargar ese archivo de forma segura.")
 
 
 async def upload_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -360,6 +342,7 @@ def build_application(settings: Settings) -> Application:
         enabled=settings.enabled_providers,
         gutendex_base_url=settings.gutendex_base_url,
         libgen_metadata_db=settings.libgen_metadata_db,
+        libgen_live_mirrors=settings.libgen_live_mirrors,
     )
     application.bot_data["library"] = PersonalLibrary(settings.data_dir)
 
