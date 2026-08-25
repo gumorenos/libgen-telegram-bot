@@ -3,10 +3,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+import shutil
 import tempfile
 import time
 from urllib.parse import urljoin
-import shutil
 
 import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -32,43 +32,44 @@ from .security import is_allowed_download_url, is_allowed_user, sanitize_filenam
 logger = logging.getLogger(__name__)
 
 
-def _auth_message(settings: Settings) -> str:
-    if settings.allowed_user_ids:
-        return "No autorizado. Usa /whoami y añade tu ID a ALLOWED_USER_IDS en el VPS."
-    return "Bot aún sin allowlist. Usa /whoami y configura ALLOWED_USER_IDS antes de usarlo."
-
-
 async def _require_allowed(update: Update, settings: Settings) -> bool:
-    user_id = update.effective_user.id if update.effective_user else None
-    if not settings.allowed_user_ids or not is_allowed_user(user_id, settings.allowed_user_ids):
-        if update.callback_query:
-            await update.callback_query.answer("No autorizado", show_alert=True)
-        elif update.effective_message:
-            await update.effective_message.reply_text(_auth_message(settings))
-        return False
-    return True
-
-
-async def heartbeat_loop() -> None:
-    while True:
-        HEARTBEAT.write_text(str(time.time()), encoding="utf-8")
-        await asyncio.sleep(20)
+    user = update.effective_user
+    if user and is_allowed_user(user.id, settings.allowed_user_ids):
+        return True
+    if update.effective_message:
+        await update.effective_message.reply_text("No autorizado.")
+    return False
 
 
 async def post_init(application: Application) -> None:
-    HEARTBEAT.write_text(str(time.time()), encoding="utf-8")
-    application.create_task(heartbeat_loop(), name="heartbeat")
+    HEARTBEAT.touch()
+    commands = [
+        ("start", "Inicio"),
+        ("search", "Buscar ebooks"),
+        ("providers", "Ver catálogos habilitados"),
+        ("library", "Ver biblioteca privada"),
+        ("status", "Estado del servicio"),
+        ("whoami", "Mostrar mi Telegram user ID"),
+        ("help", "Ayuda"),
+    ]
+    await application.bot.set_my_commands(commands)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
     if not await _require_allowed(update, settings):
         return
+    language_note = (
+        f"\nIdiomas filtrados: {', '.join(settings.search_languages)}"
+        if settings.search_languages
+        else "\nIdiomas: todos"
+    )
     await update.effective_message.reply_text(
         "📚 Bot privado de ebooks\n\n"
         "Busca en los catálogos habilitados con /search <texto> o simplemente envía un título/autor.\n"
         "También puedes subir documentos propios (máx. configurado) para guardarlos en tu biblioteca.\n\n"
         "Comandos: /search, /providers, /library, /status, /whoami, /help"
+        + language_note
     )
 
 
@@ -78,9 +79,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    if not user:
-        return
-    await update.effective_message.reply_text(f"Tu Telegram user ID es: {user.id}")
+    if user:
+        await update.effective_message.reply_text(f"Tu Telegram user ID es: {user.id}")
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -89,16 +89,26 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     lines = ["🟢 Bot: OK"]
+    if settings.search_languages:
+        lines.append(f"🔎 Idiomas: {', '.join(settings.search_languages)}")
+    else:
+        lines.append("🔎 Idiomas: todos")
+
     registry: ProviderRegistry = context.application.bot_data["providers"]
     for health in await registry.healthcheck():
         icon = "🟢" if health.ok else "🔴"
         detail = f" — {health.detail}" if health.detail else ""
-        lines.append(f"{icon} {health.label}: {'OK' if health.ok else 'ERROR'}{detail}")
+        lines.append(
+            f"{icon} {health.label}: {'OK' if health.ok else 'ERROR'}{detail}"
+        )
 
     if registry.has("gutenberg"):
         async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
             try:
-                response = await client.get("https://www.gutenberg.org/", headers={"User-Agent": "ebook-telegram-bot-status/0.2"})
+                response = await client.get(
+                    "https://www.gutenberg.org/",
+                    headers={"User-Agent": "ebook-telegram-bot-status/0.2"},
+                )
                 response.raise_for_status()
                 lines.append("🟢 Project Gutenberg files: OK")
             except httpx.HTTPError as exc:
@@ -129,11 +139,20 @@ async def providers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     for key, label in zip(registry.keys, registry.labels, strict=True):
         lines.append(f"• {key}: {label}")
     lines.append("")
-    lines.append("Para limitar una búsqueda usa /search proveedor:consulta, por ejemplo /search gutenberg:don quixote")
+    if settings.search_languages:
+        lines.append(f"Idiomas: {', '.join(settings.search_languages)}")
+    else:
+        lines.append("Idiomas: todos")
+    lines.append(
+        "Para limitar una búsqueda usa /search proveedor:consulta, por ejemplo /search gutenberg:don quixote"
+    )
     await update.effective_message.reply_text("\n".join(lines))
 
 
-def _split_provider_query(raw: str, registry: ProviderRegistry) -> tuple[str | None, str]:
+def _split_provider_query(
+    raw: str,
+    registry: ProviderRegistry,
+) -> tuple[str | None, str]:
     prefix, sep, remainder = raw.partition(":")
     key = prefix.strip().lower()
     if sep and registry.has(key) and remainder.strip():
@@ -144,18 +163,22 @@ def _split_provider_query(raw: str, registry: ProviderRegistry) -> tuple[str | N
 async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = " ".join(context.args).strip()
     if not query:
-        await update.effective_message.reply_text("Uso: /search título o autor")
+        await update.effective_message.reply_text("Uso: /search <título o autor>")
         return
     await _do_search(update, context, query)
 
 
 async def text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = (update.effective_message.text or "").strip()
-    if query:
-        await _do_search(update, context, query)
+    text = (update.effective_message.text or "").strip()
+    if text:
+        await _do_search(update, context, text)
 
 
-async def _do_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str) -> None:
+async def _do_search(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    query: str,
+) -> None:
     settings: Settings = context.application.bot_data["settings"]
     if not await _require_allowed(update, settings):
         return
@@ -164,9 +187,16 @@ async def _do_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query: 
     provider_key, clean_query = _split_provider_query(query, registry)
     msg = update.effective_message
     await msg.chat.send_action(ChatAction.TYPING)
-    scope = dict(zip(registry.keys, registry.labels, strict=True)).get(provider_key, "todos los proveedores")
+    scope = dict(zip(registry.keys, registry.labels, strict=True)).get(
+        provider_key,
+        "todos los proveedores",
+    )
     status = await msg.reply_text(f"Buscando en {scope}…")
-    books, errors = await registry.search(clean_query, settings.max_results, provider_key)
+    books, errors = await registry.search(
+        clean_query,
+        settings.max_results,
+        provider_key,
+    )
 
     context.user_data["results"] = books
     if not books:
@@ -177,9 +207,21 @@ async def _do_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query: 
     lines = [f"Resultados para: {clean_query}", ""]
     keyboard: list[list[InlineKeyboardButton]] = []
     for idx, book in enumerate(books, start=1):
-        lines.append(f"{idx}. [{book.source_label}] {book.title} — {book.author_text}")
-        keyboard.append([InlineKeyboardButton(f"{idx}. {book.title[:45]}", callback_data=f"book:{idx-1}")])
-    await status.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
+        lines.append(
+            f"{idx}. [{book.source_label}] {book.title} — {book.author_text}"
+        )
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    f"{idx}. {book.title[:45]}",
+                    callback_data=f"book:{idx - 1}",
+                )
+            ]
+        )
+    await status.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
 
 async def book_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -194,42 +236,59 @@ async def book_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         books: list[BookResult] = context.user_data.get("results", [])
         book = books[idx]
     except (ValueError, IndexError):
-        await query.edit_message_text("Ese resultado ya no está disponible. Haz una nueva búsqueda.")
+        await query.edit_message_text(
+            "Ese resultado ya no está disponible. Haz una nueva búsqueda."
+        )
         return
 
     downloads = preferred_downloads(book)
     keyboard: list[list[InlineKeyboardButton]] = []
     for d_idx, (label, url) in enumerate(downloads[:4]):
         if is_allowed_download_url(url):
-            keyboard.append([InlineKeyboardButton(f"Descargar {label}", callback_data=f"dl:{idx}:{d_idx}")])
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        f"Descargar {label}",
+                        callback_data=f"dl:{idx}:{d_idx}",
+                    )
+                ]
+            )
 
-    language = ", ".join(book.languages) if book.languages else "—"
-    count = str(book.download_count) if book.download_count is not None else "—"
+    language = ", ".join(book.languages) if book.languages else "n/d"
     text = (
         f"📖 {book.title}\n"
-        f"Fuente: {book.source_label}\n"
         f"Autor: {book.author_text}\n"
         f"Idioma: {language}\n"
-        f"Descargas de catálogo: {count}\n"
+        f"Fuente: {book.source_label}"
     )
     if not keyboard:
-        text += "\nEste proveedor aporta metadatos, pero no hay descarga automática habilitada para este resultado."
+        text += "\n\nNo hay una descarga automática permitida para este resultado."
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+    )
 
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
 
-
-async def _download_with_validated_redirects(url: str, target: Path, max_bytes: int) -> int:
+async def _download_with_validated_redirects(
+    url: str,
+    target: Path,
+    max_bytes: int,
+) -> None:
     current = url
-    async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
-        for _ in range(6):
+    async with httpx.AsyncClient(
+        timeout=30,
+        follow_redirects=False,
+        headers={"User-Agent": "ebook-telegram-bot/0.2"},
+    ) as client:
+        for _ in range(5):
             if not is_allowed_download_url(current):
-                raise ValueError("download URL is not allowed")
-            async with client.stream("GET", current, headers={"User-Agent": "ebook-telegram-bot/0.2"}) as response:
-                if response.is_redirect:
+                raise ValueError("URL no permitida")
+            async with client.stream("GET", current) as response:
+                if response.status_code in {301, 302, 303, 307, 308}:
                     location = response.headers.get("location")
                     if not location:
-                        raise ValueError("redirect without Location")
-                    current = urljoin(str(response.url), location)
+                        raise ValueError("Redirección sin Location")
+                    current = urljoin(current, location)
                     continue
                 response.raise_for_status()
                 total = 0
@@ -237,10 +296,10 @@ async def _download_with_validated_redirects(url: str, target: Path, max_bytes: 
                     async for chunk in response.aiter_bytes():
                         total += len(chunk)
                         if total > max_bytes:
-                            raise ValueError("download exceeds configured maximum")
+                            raise ValueError("Archivo demasiado grande")
                         handle.write(chunk)
-                return total
-    raise ValueError("too many redirects")
+                return
+    raise ValueError("Demasiadas redirecciones")
 
 
 async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -266,7 +325,12 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     await query.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-    suffix = {"EPUB": ".epub", "PDF": ".pdf", "TXT": ".txt", "HTML": ".html"}.get(label, ".bin")
+    suffix = {
+        "EPUB": ".epub",
+        "PDF": ".pdf",
+        "TXT": ".txt",
+        "HTML": ".html",
+    }.get(label, ".bin")
     safe_name = sanitize_filename(book.title, suffix)
     max_bytes = settings.max_download_mb * 1024 * 1024
 
@@ -275,7 +339,11 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             target = Path(temp_dir) / safe_name
             await _download_with_validated_redirects(url, target, max_bytes)
             with target.open("rb") as handle:
-                await query.message.reply_document(document=handle, filename=safe_name, caption=f"{book.title} — {book.author_text}")
+                await query.message.reply_document(
+                    document=handle,
+                    filename=safe_name,
+                    caption=f"{book.title} — {book.author_text}",
+                )
     except (httpx.HTTPError, OSError, ValueError) as exc:
         logger.warning("Download failed: %s", exc)
         await query.message.reply_text("No pude descargar ese archivo de forma segura.")
@@ -297,7 +365,10 @@ async def upload_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     library: PersonalLibrary = context.application.bot_data["library"]
-    target = library.destination(update.effective_user.id, document.file_name or "document.bin")
+    target = library.destination(
+        update.effective_user.id,
+        document.file_name or "document.bin",
+    )
     tg_file = await document.get_file()
     await tg_file.download_to_drive(custom_path=target)
     await update.effective_message.reply_text(
@@ -341,6 +412,7 @@ def build_application(settings: Settings) -> Application:
     application.bot_data["providers"] = build_registry(
         enabled=settings.enabled_providers,
         gutendex_base_url=settings.gutendex_base_url,
+        search_languages=settings.search_languages,
         libgen_metadata_db=settings.libgen_metadata_db,
         libgen_live_mirrors=settings.libgen_live_mirrors,
     )
@@ -354,8 +426,12 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("library", list_library))
     application.add_handler(CommandHandler("status", status_cmd))
     application.add_handler(CallbackQueryHandler(book_callback, pattern=r"^book:\d+$"))
-    application.add_handler(CallbackQueryHandler(download_callback, pattern=r"^dl:\d+:\d+$"))
+    application.add_handler(
+        CallbackQueryHandler(download_callback, pattern=r"^dl:\d+:\d+$")
+    )
     application.add_handler(MessageHandler(filters.Document.ALL, upload_document))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_search))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, text_search)
+    )
     application.add_error_handler(error_handler)
     return application
