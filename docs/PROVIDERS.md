@@ -14,13 +14,37 @@ against the Gutenberg hostname allowlist before a file is fetched.
 
 ### `libgen`
 
-`LibgenMetadataProvider` is deliberately **metadata-only**. It reads a local,
-read-only SQLite FTS index and returns title/author/language results with an empty
-`formats` mapping. It performs no LibGen network requests and does not construct
-mirror, MD5, torrent, or download URLs.
+`LibgenProvider` is a **hybrid metadata-only** provider. It can use two sources:
 
-The provider expects a virtual table named `libgen_book` with at least these
-columns:
+1. `LibgenMetadataProvider`: an optional local, read-only SQLite FTS index.
+2. `LibgenLiveProvider`: optional live search against operator-configured HTTPS mirrors.
+
+The local index is tried first. If it is missing, fails, or does not fill the
+requested result limit, the live provider is used. Duplicate title/author pairs
+are removed. Both sources return an empty `formats` mapping: this integration
+searches metadata but does not expose LibGen download, mirror, MD5 or torrent URLs.
+
+Configure the provider with:
+
+```dotenv
+ENABLED_PROVIDERS=gutenberg,libgen
+LIBGEN_METADATA_DB=/data/libgen-metadata.sqlite3
+LIBGEN_LIVE_MIRRORS=https://mirror-one.example,https://mirror-two.example
+```
+
+`LIBGEN_METADATA_DB` is optional in practice. If the file does not exist and at
+least one live mirror is configured, `/search libgen:query` searches live.
+`LIBGEN_LIVE_MIRRORS` may also be empty when you want local-index-only mode.
+Mirrors must be credential-free HTTPS base URLs and are supplied by the operator;
+the project intentionally ships with no hard-coded mirror list.
+
+The live provider tries the last successful mirror first and fails over to the
+remaining configured mirrors on HTTP errors or an unrecognized search page.
+`/status` reports whether the local and live sides are healthy.
+
+### Optional local metadata index
+
+The local provider expects a virtual table named `libgen_book` with at least:
 
 ```sql
 CREATE VIRTUAL TABLE libgen_book USING fts5(
@@ -31,28 +55,20 @@ CREATE VIRTUAL TABLE libgen_book USING fts5(
 ```
 
 FTS3/FTS4 indexes with the same columns also work because the provider uses the
-standard SQLite `MATCH` query syntax.
+standard SQLite `MATCH` syntax.
 
-If you already possess an authorized bibliographic CSV, a helper can build the
-minimal metadata index without importing download-related fields:
+If you already possess a bibliographic CSV you are authorized to use:
 
 ```bash
 python tools/build_metadata_index.py metadata.csv data/libgen-metadata.sqlite3
 ```
 
-Then configure:
-
-```dotenv
-ENABLED_PROVIDERS=gutenberg,libgen
-LIBGEN_METADATA_DB=/data/libgen-metadata.sqlite3
-```
-
-Use `/providers` and `/status` after restarting.
+The helper imports only title, author and language metadata.
 
 ## Search routing
 
-`/search query` searches every enabled provider concurrently and interleaves
-results so one provider cannot monopolize the result list.
+`/search query` searches every enabled top-level provider concurrently and
+interleaves results so one provider cannot monopolize the result list.
 
 A provider can be selected explicitly with a prefix:
 
@@ -60,6 +76,10 @@ A provider can be selected explicitly with a prefix:
 /search gutenberg:don quixote
 /search libgen:distributed systems
 ```
+
+For `libgen`, that one command transparently uses local metadata first and live
+search as fallback. You do not have to change the Telegram command when an index
+is later added or removed.
 
 ## Adding another lawful provider
 
