@@ -34,13 +34,19 @@ def build_registry(
     *,
     enabled: tuple[str, ...],
     gutendex_base_url: str,
+    search_languages: tuple[str, ...],
     libgen_metadata_db: Path,
     libgen_live_mirrors: tuple[str, ...],
 ) -> ProviderRegistry:
     providers: list[BookProvider] = []
     for key in enabled:
         if key == "gutenberg":
-            providers.append(GutendexProvider(gutendex_base_url))
+            providers.append(
+                GutendexProvider(
+                    gutendex_base_url,
+                    languages=search_languages,
+                )
+            )
         elif key == "libgen":
             local_provider = LibgenMetadataProvider(libgen_metadata_db)
             live_provider = (
@@ -54,7 +60,7 @@ def build_registry(
                     live_provider=live_provider,
                 )
             )
-    return ProviderRegistry(providers)
+    return ProviderRegistry(providers, languages=search_languages)
 
 
 __all__ = [
