@@ -16,6 +16,15 @@ def _csv_ints(value: str) -> frozenset[int]:
     return frozenset(values)
 
 
+def _csv_strings(value: str) -> tuple[str, ...]:
+    out: list[str] = []
+    for part in value.split(","):
+        item = part.strip()
+        if item and item not in out:
+            out.append(item)
+    return tuple(out)
+
+
 def _provider_keys(value: str) -> tuple[str, ...]:
     supported = {"gutenberg", "libgen"}
     out: list[str] = []
@@ -30,7 +39,9 @@ def _provider_keys(value: str) -> tuple[str, ...]:
         if key not in out:
             out.append(key)
     if unknown:
-        raise RuntimeError(f"Unsupported provider(s) in ENABLED_PROVIDERS: {', '.join(unknown)}")
+        raise RuntimeError(
+            f"Unsupported provider(s) in ENABLED_PROVIDERS: {', '.join(unknown)}"
+        )
     return tuple(out) or ("gutenberg",)
 
 
@@ -46,6 +57,7 @@ class Settings:
     gutendex_base_url: str
     enabled_providers: tuple[str, ...]
     libgen_metadata_db: Path
+    libgen_live_mirrors: tuple[str, ...]
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -66,9 +78,19 @@ class Settings:
             max_download_mb=max_download_mb,
             max_upload_mb=max_upload_mb,
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
-            gutendex_base_url=os.getenv("GUTENDEX_BASE_URL", "https://gutendex.com").rstrip("/"),
-            enabled_providers=_provider_keys(os.getenv("ENABLED_PROVIDERS", "gutenberg")),
+            gutendex_base_url=os.getenv(
+                "GUTENDEX_BASE_URL", "https://gutendex.com"
+            ).rstrip("/"),
+            enabled_providers=_provider_keys(
+                os.getenv("ENABLED_PROVIDERS", "gutenberg")
+            ),
             libgen_metadata_db=Path(
-                os.getenv("LIBGEN_METADATA_DB", str(data_dir / "libgen-metadata.sqlite3"))
+                os.getenv(
+                    "LIBGEN_METADATA_DB",
+                    str(data_dir / "libgen-metadata.sqlite3"),
+                )
+            ),
+            libgen_live_mirrors=_csv_strings(
+                os.getenv("LIBGEN_LIVE_MIRRORS", "")
             ),
         )
