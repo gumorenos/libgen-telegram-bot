@@ -44,9 +44,7 @@ class LibgenLiveProvider:
                 or parsed.username
                 or parsed.password
             ):
-                raise ValueError(
-                    "LibGen mirrors must be credential-free HTTPS URLs"
-                )
+                raise ValueError("LibGen mirrors must be credential-free HTTPS URLs")
             if value not in out:
                 out.append(value)
         return tuple(out)
@@ -88,7 +86,7 @@ class LibgenLiveProvider:
             books.append(
                 BookResult(
                     source="libgen",
-                    source_label=self.label if False else "LibGen live",
+                    source_label="LibGen live",
                     source_id=source_id or f"row:{len(books) + 1}",
                     title=title,
                     authors=authors[:4],
@@ -144,22 +142,13 @@ class LibgenLiveProvider:
             try:
                 return await self._search_one(mirror, query, limit)
             except (httpx.HTTPError, ValueError) as exc:
-                failures.append(
-                    f"{urlparse(mirror).hostname}: {exc.__class__.__name__}"
-                )
+                failures.append(f"{urlparse(mirror).hostname}: {exc.__class__.__name__}")
 
-        raise RuntimeError(
-            "all LibGen live mirrors failed: " + ", ".join(failures)
-        )
+        raise RuntimeError("all LibGen live mirrors failed: " + ", ".join(failures))
 
     async def healthcheck(self) -> ProviderHealth:
         if not self.mirrors:
-            return ProviderHealth(
-                self.key,
-                self.label,
-                False,
-                "sin mirrors configurados",
-            )
+            return ProviderHealth(self.key, self.label, False, "sin mirrors configurados")
 
         async with httpx.AsyncClient(
             timeout=min(self.timeout, 8.0),
@@ -181,9 +170,4 @@ class LibgenLiveProvider:
                 except httpx.HTTPError:
                     continue
 
-        return ProviderHealth(
-            self.key,
-            self.label,
-            False,
-            "ningún mirror respondió",
-        )
+        return ProviderHealth(self.key, self.label, False, "ningún mirror respondió")
