@@ -3,10 +3,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-import shutil
 import tempfile
 import time
 from urllib.parse import urljoin
+import shutil
 
 import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -26,7 +26,7 @@ from .config import Settings
 from .healthcheck import HEARTBEAT
 from .library import PersonalLibrary
 from .models import BookResult
-from .providers import GutendexProvider, preferred_downloads
+from .providers import ProviderRegistry, build_registry, preferred_downloads
 from .security import is_allowed_download_url, is_allowed_user, sanitize_filename
 
 logger = logging.getLogger(__name__)
@@ -66,9 +66,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.effective_message.reply_text(
         "📚 Bot privado de ebooks\n\n"
-        "Busca libros de dominio público con /search <texto> o simplemente envía un título/autor.\n"
+        "Busca en los catálogos habilitados con /search <texto> o simplemente envía un título/autor.\n"
         "También puedes subir documentos propios (máx. configurado) para guardarlos en tu biblioteca.\n\n"
-        "Comandos: /search, /library, /status, /whoami, /help"
+        "Comandos: /search, /providers, /library, /status, /whoami, /help"
     )
 
 
@@ -89,45 +89,56 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     lines = ["🟢 Bot: OK"]
-    async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
-        started = time.monotonic()
-        try:
-            response = await client.get(
-                f"{settings.gutendex_base_url}/books",
-                params={"search": "don quixote"},
-            )
-            response.raise_for_status()
-            payload = response.json()
-            latency_ms = round((time.monotonic() - started) * 1000)
-            results = len(payload.get("results", []))
-            lines.append(
-                f"🟢 Gutendex API: OK — {latency_ms} ms ({results} resultados de prueba)"
-            )
-        except (httpx.HTTPError, ValueError, TypeError) as exc:
-            logger.warning("Gutendex status check failed: %s", exc)
-            lines.append("🔴 Gutendex API: ERROR")
+    registry: ProviderRegistry = context.application.bot_data["providers"]
+    for health in await registry.healthcheck():
+        icon = "🟢" if health.ok else "🔴"
+        detail = f" — {health.detail}" if health.detail else ""
+        lines.append(f"{icon} {health.label}: {'OK' if health.ok else 'ERROR'}{detail}")
 
-        try:
-            response = await client.get(
-                "https://www.gutenberg.org/",
-                headers={"User-Agent": "ebook-telegram-bot-status/0.1"},
-            )
-            response.raise_for_status()
-            lines.append("🟢 Project Gutenberg: OK")
-        except httpx.HTTPError as exc:
-            logger.warning("Project Gutenberg status check failed: %s", exc)
-            lines.append("🔴 Project Gutenberg: ERROR")
+    if registry.has("gutenberg"):
+        async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
+            try:
+                response = await client.get("https://www.gutenberg.org/", headers={"User-Agent": "ebook-telegram-bot-status/0.2"})
+                response.raise_for_status()
+                lines.append("🟢 Project Gutenberg files: OK")
+            except httpx.HTTPError as exc:
+                logger.warning("Project Gutenberg status check failed: %s", exc)
+                lines.append("🔴 Project Gutenberg files: ERROR")
 
     try:
         settings.data_dir.mkdir(parents=True, exist_ok=True)
         usage = shutil.disk_usage(settings.data_dir)
-        free_gb = usage.free / (1024**3)
+        free_gb = usage.free / (1024 ** 3)
         lines.append(f"🟢 Biblioteca local: OK — {free_gb:.1f} GB libres")
     except OSError as exc:
         logger.warning("Local library status check failed: %s", exc)
         lines.append("🔴 Biblioteca local: ERROR")
 
     await update.effective_message.reply_text("\n".join(lines))
+
+
+async def providers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if not await _require_allowed(update, settings):
+        return
+    registry: ProviderRegistry = context.application.bot_data["providers"]
+    if not registry.keys:
+        await update.effective_message.reply_text("No hay proveedores habilitados.")
+        return
+    lines = ["📚 Proveedores habilitados:"]
+    for key, label in zip(registry.keys, registry.labels, strict=True):
+        lines.append(f"• {key}: {label}")
+    lines.append("")
+    lines.append("Para limitar una búsqueda usa /search proveedor:consulta, por ejemplo /search gutenberg:don quixote")
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+def _split_provider_query(raw: str, registry: ProviderRegistry) -> tuple[str | None, str]:
+    prefix, sep, remainder = raw.partition(":")
+    key = prefix.strip().lower()
+    if sep and registry.has(key) and remainder.strip():
+        return key, remainder.strip()
+    return None, raw.strip()
 
 
 async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -149,38 +160,26 @@ async def _do_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query: 
     if not await _require_allowed(update, settings):
         return
 
-    provider: GutendexProvider = context.application.bot_data["provider"]
+    registry: ProviderRegistry = context.application.bot_data["providers"]
+    provider_key, clean_query = _split_provider_query(query, registry)
     msg = update.effective_message
     await msg.chat.send_action(ChatAction.TYPING)
-    status = await msg.reply_text("Buscando en Project Gutenberg…")
-    try:
-        books = await provider.search(query, settings.max_results)
-    except httpx.HTTPError as exc:
-        logger.warning("Search failed: %s", exc)
-        await status.edit_text("No pude consultar el catálogo en este momento.")
-        return
+    scope = dict(zip(registry.keys, registry.labels, strict=True)).get(provider_key, "todos los proveedores")
+    status = await msg.reply_text(f"Buscando en {scope}…")
+    books, errors = await registry.search(clean_query, settings.max_results, provider_key)
 
     context.user_data["results"] = books
     if not books:
-        await status.edit_text("No encontré resultados de dominio público.")
+        suffix = f"\nProblemas: {'; '.join(errors)}" if errors else ""
+        await status.edit_text(f"No encontré resultados.{suffix}")
         return
 
-    lines = [f"Resultados para: {query}", ""]
+    lines = [f"Resultados para: {clean_query}", ""]
     keyboard: list[list[InlineKeyboardButton]] = []
     for idx, book in enumerate(books, start=1):
-        lines.append(f"{idx}. {book.title} — {book.author_text}")
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    f"{idx}. {book.title[:45]}",
-                    callback_data=f"book:{idx - 1}",
-                )
-            ]
-        )
-    await status.edit_text(
-        "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+        lines.append(f"{idx}. [{book.source_label}] {book.title} — {book.author_text}")
+        keyboard.append([InlineKeyboardButton(f"{idx}. {book.title[:45]}", callback_data=f"book:{idx-1}")])
+    await status.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def book_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -195,39 +194,27 @@ async def book_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         books: list[BookResult] = context.user_data.get("results", [])
         book = books[idx]
     except (ValueError, IndexError):
-        await query.edit_message_text(
-            "Ese resultado ya no está disponible. Haz una nueva búsqueda."
-        )
+        await query.edit_message_text("Ese resultado ya no está disponible. Haz una nueva búsqueda.")
         return
 
     downloads = preferred_downloads(book)
     keyboard: list[list[InlineKeyboardButton]] = []
     for d_idx, (label, url) in enumerate(downloads[:4]):
         if is_allowed_download_url(url):
-            keyboard.append(
-                [
-                    InlineKeyboardButton(
-                        f"Descargar {label}",
-                        callback_data=f"dl:{idx}:{d_idx}",
-                    )
-                ]
-            )
+            keyboard.append([InlineKeyboardButton(f"Descargar {label}", callback_data=f"dl:{idx}:{d_idx}")])
 
     language = ", ".join(book.languages) if book.languages else "—"
     count = str(book.download_count) if book.download_count is not None else "—"
     text = (
-        f"📖 {book.title}\n"
+        f"📶 {book.title}\n"
         f"Autor: {book.author_text}\n"
         f"Idioma: {language}\n"
         f"Descargas en catálogo: {count}\n"
-        "Fuente: Project Gutenberg"
+        f"Fuente: {book.source_label}"
     )
     if not keyboard:
         text += "\n\nNo hay un formato descargable permitido para este resultado."
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
-    )
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
 
 
 async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -249,18 +236,11 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     if not is_allowed_download_url(url):
-        await query.message.reply_text(
-            "URL de descarga rechazada por la política de seguridad del bot."
-        )
+        await query.message.reply_text("URL de descarga rechazada por la política de seguridad del bot.")
         return
 
     max_bytes = settings.max_download_mb * 1024 * 1024
-    suffix = {
-        "EPUB": ".epub",
-        "PDF": ".pdf",
-        "TXT": ".txt",
-        "HTML": ".html",
-    }.get(label, ".bin")
+    suffix = {"EPUB": ".epub", "PDF": ".pdf", "TXT": ".txt", "HTML": ".html"}.get(label, ".bin")
     filename = sanitize_filename(f"{book.title}{suffix}")
 
     await query.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
@@ -279,11 +259,7 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     await response.aclose()
                     response = None
                     if not location:
-                        raise httpx.HTTPStatusError(
-                            "redirect without location",
-                            request=request,
-                            response=httpx.Response(502, request=request),
-                        )
+                        raise httpx.HTTPStatusError("redirect without location", request=request, response=httpx.Response(502, request=request))
                     current_url = urljoin(current_url, location)
                     continue
                 response.raise_for_status()
@@ -296,41 +272,26 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
             content_length = int(response.headers.get("content-length", "0") or 0)
             if content_length and content_length > max_bytes:
-                await query.message.reply_text(
-                    f"El archivo supera el límite configurado de {settings.max_download_mb} MB."
-                )
+                await query.message.reply_text(f"El archivo supera el límite configurado de {settings.max_download_mb} MB.")
                 return
 
-            with tempfile.NamedTemporaryFile(
-                prefix="bookbot-",
-                suffix=suffix,
-                delete=False,
-            ) as tmp:
+            with tempfile.NamedTemporaryFile(prefix="bookbot-", suffix=suffix, delete=False) as tmp:
                 path = Path(tmp.name)
                 total = 0
                 async for chunk in response.aiter_bytes():
                     total += len(chunk)
                     if total > max_bytes:
-                        await query.message.reply_text(
-                            f"El archivo supera el límite configurado de {settings.max_download_mb} MB."
-                        )
+                        await query.message.reply_text(f"El archivo supera el límite configurado de {settings.max_download_mb} MB.")
                         return
                     tmp.write(chunk)
 
         if path is None:
             raise ValueError("temporary download missing")
         with path.open("rb") as fh:
-            await query.message.reply_document(
-                document=fh,
-                filename=filename,
-                read_timeout=120,
-                write_timeout=120,
-            )
+            await query.message.reply_document(document=fh, filename=filename, read_timeout=120, write_timeout=120)
     except (httpx.HTTPError, ValueError) as exc:
         logger.warning("Download failed: %s", exc)
-        await query.message.reply_text(
-            "No pude descargar ese archivo desde Project Gutenberg."
-        )
+        await query.message.reply_text("No pude descargar ese archivo desde la fuente permitida.")
     finally:
         if response is not None:
             await response.aclose()
@@ -354,10 +315,7 @@ async def upload_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     library: PersonalLibrary = context.application.bot_data["library"]
-    target = library.destination(
-        update.effective_user.id,
-        document.file_name or "document.bin",
-    )
+    target = library.destination(update.effective_user.id, document.file_name or "document.bin")
     tg_file = await document.get_file()
     await tg_file.download_to_drive(custom_path=target)
     await update.effective_message.reply_text(
@@ -398,22 +356,23 @@ def build_application(settings: Settings) -> Application:
         .build()
     )
     application.bot_data["settings"] = settings
-    application.bot_data["provider"] = GutendexProvider(settings.gutendex_base_url)
+    application.bot_data["providers"] = build_registry(
+        enabled=settings.enabled_providers,
+        gutendex_base_url=settings.gutendex_base_url,
+        libgen_metadata_db=settings.libgen_metadata_db,
+    )
     application.bot_data["library"] = PersonalLibrary(settings.data_dir)
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("whoami", whoami))
     application.add_handler(CommandHandler("search", search_cmd))
+    application.add_handler(CommandHandler("providers", providers_cmd))
     application.add_handler(CommandHandler("library", list_library))
     application.add_handler(CommandHandler("status", status_cmd))
     application.add_handler(CallbackQueryHandler(book_callback, pattern=r"^book:\d+$"))
-    application.add_handler(
-        CallbackQueryHandler(download_callback, pattern=r"^dl:\d+:\d+$")
-    )
+    application.add_handler(CallbackQueryHandler(download_callback, pattern=r"^dl:\d+:\d+$"))
     application.add_handler(MessageHandler(filters.Document.ALL, upload_document))
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, text_search)
-    )
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_search))
     application.add_error_handler(error_handler)
     return application

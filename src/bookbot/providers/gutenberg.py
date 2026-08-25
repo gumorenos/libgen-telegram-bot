@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import time
+
 import httpx
 
-from .models import BookResult
+from ..models import BookResult
+from .base import ProviderHealth
 
 
 class GutendexProvider:
+    key = "gutenberg"
+    label = "Project Gutenberg"
+
     def __init__(self, base_url: str, timeout: float = 15.0) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -26,6 +32,8 @@ class GutendexProvider:
             }
             books.append(
                 BookResult(
+                    source=self.key,
+                    source_label=self.label,
                     source_id=str(item.get("id", "")),
                     title=(item.get("title") or "Sin título").strip(),
                     authors=authors,
@@ -36,21 +44,15 @@ class GutendexProvider:
             )
         return books
 
-
-def preferred_downloads(book: BookResult) -> list[tuple[str, str]]:
-    preferred = [
-        ("application/epub+zip", "EPUB"),
-        ("application/pdf", "PDF"),
-        ("text/plain; charset=utf-8", "TXT"),
-        ("text/plain", "TXT"),
-        ("text/html; charset=utf-8", "HTML"),
-        ("text/html", "HTML"),
-    ]
-    out: list[tuple[str, str]] = []
-    seen_urls: set[str] = set()
-    for mime, label in preferred:
-        url = book.formats.get(mime)
-        if url and url not in seen_urls:
-            out.append((label, url))
-            seen_urls.add(url)
-    return out
+    async def healthcheck(self) -> ProviderHealth:
+        started = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
+                response = await client.get(f"{self.base_url}/books", params={"search": "don quixote"})
+                response.raise_for_status()
+                payload = response.json()
+            latency_ms = round((time.monotonic() - started) * 1000)
+            results = len(payload.get("results", []))
+            return ProviderHealth(self.key, self.label, True, f"{latency_ms} ms; {results} resultados de prueba")
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            return ProviderHealth(self.key, self.label, False, type(exc).__name__)

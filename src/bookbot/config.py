@@ -11,10 +11,27 @@ def _csv_ints(value: str) -> frozenset[int]:
     values: set[int] = set()
     for part in value.split(","):
         part = part.strip()
-        if not part:
-            continue
-        values.add(int(part))
+        if part:
+            values.add(int(part))
     return frozenset(values)
+
+
+def _provider_keys(value: str) -> tuple[str, ...]:
+    supported = {"gutenberg", "libgen"}
+    out: list[str] = []
+    unknown: list[str] = []
+    for part in value.split(","):
+        key = part.strip().lower()
+        if not key:
+            continue
+        if key not in supported:
+            unknown.append(key)
+            continue
+        if key not in out:
+            out.append(key)
+    if unknown:
+        raise RuntimeError(f"Unsupported provider(s) in ENABLED_PROVIDERS: {', '.join(unknown)}")
+    return tuple(out) or ("gutenberg",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +44,8 @@ class Settings:
     max_upload_mb: int
     log_level: str
     gutendex_base_url: str
+    enabled_providers: tuple[str, ...]
+    libgen_metadata_db: Path
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -37,14 +56,19 @@ class Settings:
         max_results = min(max(int(os.getenv("MAX_RESULTS", "8")), 1), 10)
         max_download_mb = min(max(int(os.getenv("MAX_DOWNLOAD_MB", "48")), 1), 49)
         max_upload_mb = min(max(int(os.getenv("MAX_UPLOAD_MB", "19")), 1), 19)
+        data_dir = Path(os.getenv("DATA_DIR", "/data"))
 
         return cls(
             telegram_bot_token=token,
             allowed_user_ids=_csv_ints(os.getenv("ALLOWED_USER_IDS", "")),
-            data_dir=Path(os.getenv("DATA_DIR", "/data")),
+            data_dir=data_dir,
             max_results=max_results,
             max_download_mb=max_download_mb,
             max_upload_mb=max_upload_mb,
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
             gutendex_base_url=os.getenv("GUTENDEX_BASE_URL", "https://gutendex.com").rstrip("/"),
+            enabled_providers=_provider_keys(os.getenv("ENABLED_PROVIDERS", "gutenberg")),
+            libgen_metadata_db=Path(
+                os.getenv("LIBGEN_METADATA_DB", str(data_dir / "libgen-metadata.sqlite3"))
+            ),
         )

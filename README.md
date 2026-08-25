@@ -113,9 +113,11 @@ You can also verify the live dependencies from Telegram:
 /status
 ```
 
-This checks the bot process, Gutendex search API, Project Gutenberg, and local library storage.
+This checks the bot process, every enabled provider, Project Gutenberg file access, and local library storage.
 
 ## Updating
+
+If this lives in Git:
 
 ```bash
 cd /opt/ebook-telegram-bot
@@ -184,10 +186,45 @@ GitHub Actions runs compile checks and `pytest` automatically on pushes and pull
 
 ## Next sensible improvements
 
-1. SQLite metadata index for the personal library.
+1. SQLite index for the personal uploaded-file library.
 2. `/get` command to retrieve an uploaded file.
 3. Covers and richer result cards.
 4. Pagination.
 5. Open Library metadata provider.
 6. Automatic duplicate detection by SHA-256.
 7. Optional self-hosted Telegram Bot API server if you genuinely need files larger than hosted Bot API limits.
+
+## Multi-provider architecture
+
+The bot now uses a provider registry instead of wiring Telegram directly to Gutendex.
+
+Enabled providers are configured with:
+
+```dotenv
+ENABLED_PROVIDERS=gutenberg
+```
+
+Use `/providers` to list the active catalogs. `/search query` searches all enabled providers and interleaves their results. To target one provider, prefix the query:
+
+```text
+/search gutenberg:don quixote
+```
+
+### Optional LibGen metadata adapter
+
+A **metadata-only**, local SQLite adapter is included but disabled by default. It makes no LibGen network requests, returns no download URLs, and does not construct mirror/MD5/torrent links. It expects a compatible SQLite FTS table named `libgen_book` with `title`, `author`, and `language` columns.
+
+If you already possess a bibliographic CSV that you are authorized to use, you can build the minimal index locally:
+
+```bash
+python tools/build_metadata_index.py metadata.csv data/libgen-metadata.sqlite3
+```
+
+The helper deliberately imports only title, author and language metadata. Then configure:
+
+```dotenv
+ENABLED_PROVIDERS=gutenberg,libgen
+LIBGEN_METADATA_DB=/data/libgen-metadata.sqlite3
+```
+
+Then rebuild/restart and check `/providers` and `/status`. The download pipeline remains restricted to the Gutenberg HTTPS allowlist. See `docs/PROVIDERS.md` for the provider contract and extension guide.
