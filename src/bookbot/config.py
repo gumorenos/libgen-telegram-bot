@@ -3,6 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import re
+
+
+_LANGUAGE_CODE = re.compile(r"^[a-z]{2}$")
 
 
 def _csv_ints(value: str) -> frozenset[int]:
@@ -23,6 +27,26 @@ def _csv_strings(value: str) -> tuple[str, ...]:
         if item and item not in out:
             out.append(item)
     return tuple(out)
+
+
+def _language_codes(value: str) -> tuple[str, ...]:
+    codes: list[str] = []
+    invalid: list[str] = []
+    for part in value.split(","):
+        code = part.strip().lower()
+        if not code:
+            continue
+        if not _LANGUAGE_CODE.fullmatch(code):
+            invalid.append(code)
+            continue
+        if code not in codes:
+            codes.append(code)
+    if invalid:
+        raise RuntimeError(
+            "SEARCH_LANGUAGES must contain comma-separated two-letter language codes; "
+            f"invalid: {', '.join(invalid)}"
+        )
+    return tuple(codes)
 
 
 def _provider_keys(value: str) -> tuple[str, ...]:
@@ -56,6 +80,7 @@ class Settings:
     log_level: str
     gutendex_base_url: str
     enabled_providers: tuple[str, ...]
+    search_languages: tuple[str, ...]
     libgen_metadata_db: Path
     libgen_live_mirrors: tuple[str, ...]
 
@@ -84,6 +109,7 @@ class Settings:
             enabled_providers=_provider_keys(
                 os.getenv("ENABLED_PROVIDERS", "gutenberg")
             ),
+            search_languages=_language_codes(os.getenv("SEARCH_LANGUAGES", "")),
             libgen_metadata_db=Path(
                 os.getenv(
                     "LIBGEN_METADATA_DB",
